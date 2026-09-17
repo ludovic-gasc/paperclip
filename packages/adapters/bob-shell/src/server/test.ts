@@ -38,7 +38,7 @@ async function checkCliInstalled(
     const e = err as NodeJS.ErrnoException;
     if (e.code === "ENOENT") {
       return {
-        level: "warn",
+        level: "error",
         message: `IBM Bob CLI "${command}" not found in PATH`,
         hint: "Install IBM Bob and ensure the `bob` binary is in your PATH. See https://bob.ibm.com/docs/shell/getting-started/install-bobshell",
         code: "bob_cli_not_found",
