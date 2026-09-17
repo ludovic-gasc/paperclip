@@ -7,7 +7,7 @@
   {
     "dir": "packages/adapters/bob-shell",
     "name": "@paperclipai/adapter-bob-shell",
-    "publishFromCi": true
+    "publishFromCi": false
   },
   {
     "dir": "packages/adapters/claude-local",
