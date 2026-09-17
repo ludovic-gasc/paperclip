@@ -43,6 +43,16 @@ function parseEnvBindings(bindings: unknown): Record<string, unknown> {
           ? { version: rec.version }
           : {}),
       };
+      continue;
+    }
+    if (rec.type === "user_secret_ref" && typeof rec.secretId === "string") {
+      env[key] = {
+        type: "user_secret_ref",
+        secretId: rec.secretId,
+        ...(typeof rec.version === "number" || rec.version === "latest"
+          ? { version: rec.version }
+          : {}),
+      };
     }
   }
   return env;
