@@ -1,9 +1,24 @@
 /**
- * Tests for parseBobStreamOutput and isBobLimitError.
+ * Tests for parseBobStreamOutput, isBobLimitError, and execute.
  */
 
-import { describe, it, expect } from "vitest";
-import { parseBobStreamOutput, isBobLimitError } from "./execute.js";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { parseBobStreamOutput, isBobLimitError, execute } from "./execute.js";
+
+// ---------------------------------------------------------------------------
+// Mock runChildProcess from adapter-utils so execute() never spawns a real process
+// ---------------------------------------------------------------------------
+
+vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
+  return {
+    ...actual,
+    runChildProcess: vi.fn(),
+  };
+});
+
+import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
+const mockRunChildProcess = vi.mocked(serverUtils.runChildProcess);
 
 // ---------------------------------------------------------------------------
 // parseBobStreamOutput
@@ -139,5 +154,103 @@ describe("isBobLimitError", () => {
         }),
       ),
     ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// execute
+// ---------------------------------------------------------------------------
+
+function makeCtx(overrides: Record<string, unknown> = {}) {
+  return {
+    runId: "run-1",
+    authToken: "token-abc",
+    agent: { id: "agent-1", name: "TestBot", companyId: "co-1", adapterType: "bob_shell", adapterConfig: {} },
+    config: {},
+    context: {},
+    runtime: { sessionParams: null },
+    onLog: vi.fn().mockResolvedValue(undefined),
+    onSpawn: vi.fn(),
+    ...overrides,
+  } as unknown as Parameters<typeof execute>[0];
+}
+
+describe("execute", () => {
+  beforeEach(() => {
+    mockRunChildProcess.mockReset();
+  });
+
+  it("runs a new session and passes prompt via stdin", async () => {
+    const successStdout = [
+      JSON.stringify({ type: "message", role: "assistant", content: "Done." }),
+      JSON.stringify({
+        type: "result",
+        status: "success",
+        stats: { task_id: "new-task-42", input_tokens: 100, output_tokens: 50 },
+        last_message: "Task complete.",
+      }),
+    ].join("\n");
+
+    mockRunChildProcess.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: successStdout,
+      stderr: "",
+      pid: 1234,
+      startedAt: new Date().toISOString(),
+    });
+
+    const result = await execute(makeCtx());
+
+    // Spawned with "run" (not --resume) and stream-json
+    const callArgs = mockRunChildProcess.mock.calls[0];
+    expect(callArgs[1]).toMatch(/bob/i); // command
+    expect(callArgs[2]).toContain("run");
+    expect(callArgs[2]).toContain("--format");
+    expect(callArgs[2]).toContain("stream-json");
+    expect(callArgs[2]).not.toContain("--resume");
+
+    // stdin carries the prompt
+    expect((callArgs[3] as Record<string, unknown>).stdin).toBeTruthy();
+
+    // Result reflects parsed output
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("Task complete.");
+    expect(result.sessionParams).toMatchObject({ taskId: "new-task-42" });
+    expect(result.usage?.inputTokens).toBe(100);
+    expect(result.usage?.outputTokens).toBe(50);
+  });
+
+  it("resumes a previous session by passing --resume <task-id>", async () => {
+    const successStdout = JSON.stringify({
+      type: "result",
+      status: "success",
+      stats: { task_id: "old-task-99", input_tokens: 20, output_tokens: 10 },
+      last_message: "Resumed and done.",
+    });
+
+    mockRunChildProcess.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: successStdout,
+      stderr: "",
+      pid: 5678,
+      startedAt: new Date().toISOString(),
+    });
+
+    const ctx = makeCtx({
+      runtime: { sessionParams: { taskId: "old-task-99", cwd: "" } },
+    });
+
+    const result = await execute(ctx);
+
+    const callArgs = mockRunChildProcess.mock.calls[0];
+    expect(callArgs[2]).toContain("--resume");
+    expect(callArgs[2]).toContain("old-task-99");
+
+    expect(result.sessionParams).toMatchObject({ taskId: "old-task-99" });
+    expect(result.summary).toBe("Resumed and done.");
   });
 });
