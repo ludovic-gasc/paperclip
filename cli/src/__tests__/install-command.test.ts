@@ -178,7 +178,7 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(11);
+    expect(buildCalls).toHaveLength(13);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
@@ -194,9 +194,9 @@ describe("managed install commands", () => {
       "bundled skills must be copied into the packages that list them",
     ).toBe(true);
     expect(
-      buildCalls.some(([file, args]) => file === "corepack" && args.includes("--if-present") && args.includes("-r")),
-      "every workspace package must be built before packing",
-    ).toBe(true);
+      buildCalls.filter(([file, args]) => file === "corepack" && args[1] === "--dir" && args.includes("--if-present")),
+      "every staged workspace package must be built before packing",
+    ).toHaveLength(3);
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
   });

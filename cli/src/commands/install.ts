@@ -276,17 +276,24 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 });
     await runCommand("corepack", ["enable", "pnpm", "--install-directory", pnpmShimDir], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    // Package staging consumes publish-only artifacts: every workspace package's
-    // compiled output (adapters included), the UI dist inside the server package,
-    // and the bundled skills copies. release.sh prepares all of them before
-    // packing; a git-ref install has to do the same, or staging fails (ENOENT on
-    // server/ui-dist) or ships packages without their build output.
-    await runCommand("corepack", ["pnpm", "-r", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
+    const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    // Sandbox-provider plugins live outside the pnpm workspace, so the root
+    // install gives them no dependencies. release.sh builds them standalone
+    // before packaging; without that step their staging fails.
+    await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "build-standalone-public-packages.mjs")], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 64 * 1024 * 1024 });
+    // Package staging consumes publish-only artifacts: compiled output for every
+    // staged package, the UI dist inside @paperclipai/server, and the bundled
+    // skills copies. release.sh prepares all of them before packing. Build only
+    // the staged packages, in dependency order — a recursive workspace build also
+    // builds packages this payload does not contain and can fail on
+    // environment-only prerequisites such as native addon headers.
+    for (const workspacePackage of workspacePackages) {
+      await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    }
     await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["-c", "for dir in server packages/adapters/claude-local packages/adapters/codex-local; do rm -rf \"$dir/skills\" && cp -r skills \"$dir/skills\"; done"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
-    const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
