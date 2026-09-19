@@ -276,7 +276,15 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 });
     await runCommand("corepack", ["enable", "pnpm", "--install-directory", pnpmShimDir], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    // A git payload has no release version. release.sh rewrites every public
+    // package to the calver version before packing; without that rewrite the
+    // staged packages keep their placeholder versions, so cross-package
+    // `workspace:*` specs (materialized to the dependent's version) match no
+    // tarball and `npm install` fails with notarget. Use the CLI's own version so
+    // the payload stays internally consistent.
+    await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "release-package-map.mjs"), "set-version", metadata.version], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     // Sandbox-provider plugins live outside the pnpm workspace, so the root
     // install gives them no dependencies. release.sh builds them standalone
     // before packaging; without that step their staging fails.
@@ -293,7 +301,6 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["-c", "for dir in server packages/adapters/claude-local packages/adapters/codex-local; do rm -rf \"$dir/skills\" && cp -r skills \"$dir/skills\"; done"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
