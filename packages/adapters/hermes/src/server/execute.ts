@@ -6,6 +6,9 @@
  *
  * Verified CLI flags (hermes chat):
  *   -q/--query         single query (non-interactive)
+ *   --query-file       read the query from a file ('-' reads stdin); the
+ *                      fallback used when the query cannot fit in one argv
+ *                      entry (see query-transport.ts)
  *   -Q/--quiet         quiet mode (no banner/spinner, only response + session_id)
  *   -m/--model         model name (e.g. anthropic/claude-sonnet-4)
  *   -t/--toolsets      comma-separated toolsets to enable
@@ -19,6 +22,7 @@
  */
 
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import type {
@@ -53,6 +57,14 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
+import { hermesSupportsQueryFile } from "./cli-capabilities.js";
+import {
+  HERMES_MAX_INLINE_QUERY_BYTES,
+  HERMES_QUERY_FILE_FLAG,
+  applyQueryFileTransport,
+  assertHermesChatQueryTransport,
+  queryExceedsInlineLimit,
+} from "./query-transport.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 // ---------------------------------------------------------------------------
@@ -438,7 +450,7 @@ export async function execute(
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
-  const args: string[] = ["chat", "-q", prompt];
+  let args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
 
   if (model) {
@@ -522,6 +534,54 @@ export async function execute(
     // Non-fatal
   }
 
+  // ── Keep an oversized query out of argv ────────────────────────────────
+  // `-q <prompt>` is a single argv entry, and Linux caps one entry at
+  // MAX_ARG_STRLEN (131072 bytes), independently of the much larger total
+  // ARG_MAX budget. A long wake history plus the agent instructions crosses
+  // that size and spawn() fails with E2BIG before Hermes starts, which leaves
+  // the agent looping in `error` with no run. Above the cap the query moves to
+  // a private file that `--query-file` reads, but only after probing that the
+  // configured CLI advertises the flag: a hard switch would break operators
+  // running an older binary or a wrapper.
+  let promptTempDir: string | null = null;
+  if (queryExceedsInlineLimit(prompt)) {
+    const promptBytes = Buffer.byteLength(prompt, "utf8");
+    const support = await hermesSupportsQueryFile({
+      command: hermesCmd,
+      cwd,
+      env,
+      signal: ctx.signal,
+    });
+    if (support !== true) {
+      const cause =
+        support === false
+          ? `the configured CLI (${hermesCmd}) does not advertise --query-file in "hermes chat --help"`
+          : `the --query-file capability probe on ${hermesCmd} was inconclusive (cancelled, timed out, or the binary could not be started)`;
+      const message =
+        `[hermes] Prompt is ${promptBytes} bytes, over the ${HERMES_MAX_INLINE_QUERY_BYTES}-byte single-argument limit, and ${cause}. ` +
+        "Refusing to start instead of failing later with E2BIG. Update the Hermes CLI to a build that supports " +
+        '"hermes chat --query-file", or reduce the wake history / agent instructions.';
+      await ctx.onLog("stderr", `${message}\n`);
+      throw new Error(message);
+    }
+
+    // 0700 directory holding a 0600 file: the prompt carries task content and
+    // must not be world-readable in a shared temp directory.
+    promptTempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-prompt-"));
+    const queryFilePath = path.join(promptTempDir, "query.txt");
+    await fs.writeFile(queryFilePath, prompt, { encoding: "utf8", mode: 0o600 });
+    args = applyQueryFileTransport(args, queryFilePath);
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Prompt is ${promptBytes} bytes (single-argument limit ${HERMES_MAX_INLINE_QUERY_BYTES}); passing it via ${HERMES_QUERY_FILE_FLAG}\n`,
+    );
+  }
+
+  // Assert the query slot before spawning: a `--query-file` placed anywhere
+  // else in argv is read as positional text by `hermes chat` and the run never
+  // starts.
+  assertHermesChatQueryTransport(args);
+
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
@@ -558,14 +618,23 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
-    onSpawn: ctx.onSpawn,
-  });
+  let result: Awaited<ReturnType<typeof runChildProcess>>;
+  try {
+    result = await runChildProcess(ctx.runId, hermesCmd, args, {
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+      onSpawn: ctx.onSpawn,
+    });
+  } finally {
+    if (promptTempDir) {
+      await fs.rm(promptTempDir, { recursive: true, force: true }).catch(() => {
+        // Best-effort cleanup: the run result matters more than the temp dir.
+      });
+    }
+  }
 
   // ── Parse output ───────────────────────────────────────────────────────
   const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
