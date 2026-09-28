@@ -297,7 +297,11 @@ Paperclip                          Hermes Agent
 ```
 
 The adapter spawns Hermes Agent's CLI in single-query mode (`-q`). Hermes
-processes the task using its full tool suite, then exits. The adapter:
+processes the task using its full tool suite, then exits. A query at or above
+`MAX_ARG_STRLEN` (131072 bytes on Linux) cannot travel as one argv entry, so the
+adapter writes it to a private file and passes `--query-file <path>` instead —
+after probing that the configured CLI advertises the flag. See
+`src/server/query-transport.ts`. The adapter:
 
 1. **Captures** stdout/stderr and parses token usage, session IDs, and cost
 2. **Parses** raw output into structured `TranscriptEntry` objects (tool cards with status icons)
