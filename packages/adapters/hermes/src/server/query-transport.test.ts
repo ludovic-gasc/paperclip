@@ -14,51 +14,63 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS,
   HERMES_MAX_INLINE_QUERY_BYTES,
-  HERMES_MAX_INLINE_QUERY_BYTES_LINUX,
-  HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS,
   applyQueryFileTransport,
   assertHermesChatQueryTransport,
-  hermesInlineQueryLimit,
   queryExceedsInlineLimit,
+  windowsCommandLineUnits,
 } from "./query-transport.js";
 
-describe("hermesInlineQueryLimit", () => {
-  test("Linux keeps the per-entry MAX_ARG_STRLEN cap", () => {
-    expect(hermesInlineQueryLimit("linux")).toBe(131072);
-    expect(HERMES_MAX_INLINE_QUERY_BYTES_LINUX).toBe(131072);
-  });
-
-  test("Windows uses the whole-command-line budget, not the Linux per-entry cap", () => {
-    // CreateProcess caps the whole command line at 32767 UTF-16 units, so a
-    // 131072-byte entry can never be launched from there.
-    expect(hermesInlineQueryLimit("win32")).toBe(HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS);
-    expect(HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS).toBeLessThan(32767);
-  });
-
-  test("the exported limit is the limit of the host platform", () => {
-    expect(HERMES_MAX_INLINE_QUERY_BYTES).toBe(hermesInlineQueryLimit(process.platform));
-  });
-});
-
 describe("queryExceedsInlineLimit", () => {
+  // The complete inline command line, as execute.ts builds it.
+  const inlineArgs = (query: string) => ["chat", "-q", query, "-Q"];
+
   test("a query one byte under MAX_ARG_STRLEN stays in argv", () => {
-    expect(queryExceedsInlineLimit("y".repeat(HERMES_MAX_INLINE_QUERY_BYTES - 1))).toBe(false);
+    expect(queryExceedsInlineLimit("y".repeat(HERMES_MAX_INLINE_QUERY_BYTES - 1), inlineArgs(""), "linux")).toBe(false);
   });
 
   test("a query of exactly MAX_ARG_STRLEN bytes leaves argv", () => {
-    expect(queryExceedsInlineLimit("y".repeat(HERMES_MAX_INLINE_QUERY_BYTES))).toBe(true);
+    expect(queryExceedsInlineLimit("y".repeat(HERMES_MAX_INLINE_QUERY_BYTES), inlineArgs(""), "linux")).toBe(true);
   });
 
   test("counts UTF-8 bytes, not UTF-16 code units", () => {
     // 40000 astral-plane characters are 160000 bytes but only 80000 JS units.
     const astral = "\u{1F600}".repeat(40000);
     expect(astral.length).toBe(80000);
-    expect(queryExceedsInlineLimit(astral)).toBe(true);
+    expect(queryExceedsInlineLimit(astral, inlineArgs(""), "linux")).toBe(true);
   });
 
   test("an empty query is inline", () => {
-    expect(queryExceedsInlineLimit("")).toBe(false);
+    expect(queryExceedsInlineLimit("", inlineArgs(""), "linux")).toBe(false);
+  });
+
+  // Windows caps the whole command line instead of one entry, so a query that
+  // still leaves the command line inside the budget must keep the `-q` path.
+  // Refusing it would turn a run that used to start into an error.
+  test("Windows keeps the query inline while the complete command line fits", () => {
+    const query = "y".repeat(9000);
+    expect(queryExceedsInlineLimit(query, inlineArgs(query), "win32")).toBe(false);
+  });
+
+  test("Windows moves the query out once the complete command line no longer fits", () => {
+    const query = "y".repeat(HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS);
+    expect(queryExceedsInlineLimit(query, inlineArgs(query), "win32")).toBe(true);
+  });
+
+  test("Windows counts the flags around the query, not the query alone", () => {
+    const query = "y".repeat(20000);
+    const bare = ["chat", "-q", query];
+    const padded = [...bare, ...Array.from({ length: 1500 }, () => "--yolo")];
+    expect(queryExceedsInlineLimit(query, bare, "win32")).toBe(false);
+    expect(queryExceedsInlineLimit(query, padded, "win32")).toBe(true);
+    expect(windowsCommandLineUnits(padded)).toBeGreaterThan(windowsCommandLineUnits(bare));
+  });
+
+  test("Windows refuses to guess without the command line", () => {
+    expect(() => queryExceedsInlineLimit("y".repeat(10), [], "win32")).toThrow(
+      /complete command line/,
+    );
   });
 });
 

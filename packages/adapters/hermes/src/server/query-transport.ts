@@ -14,51 +14,72 @@
  */
 
 /**
- * Largest query the adapter passes as a single argv entry on Linux.
+ * Largest query the adapter passes as a single argv entry.
  *
  * `MAX_ARG_STRLEN` is `32 * PAGE_SIZE`, so 131072 bytes on a 4 KiB-page kernel.
  * Measured on Linux 7.2.x / PAGE_SIZE 4096: 131071 bytes start, 131072 bytes
  * fail with `E2BIG`. This is a compile-time kernel constant, not a sysctl:
  * `RLIMIT_STACK` moves the total argv+env budget, never the per-string cap.
+ *
+ * Linux is the only platform that caps one argv entry, so this is the inline
+ * rule everywhere except Windows, which caps the whole command line instead
+ * (see `queryExceedsInlineLimit`).
  */
-export const HERMES_MAX_INLINE_QUERY_BYTES_LINUX = 131072;
+export const HERMES_MAX_INLINE_QUERY_BYTES = 131072;
 
 /**
- * Largest query the adapter passes as a single argv entry on Windows.
- *
- * Windows has no per-entry cap. `CreateProcess` limits the whole command line
- * to 32767 UTF-16 units, program name and every other flag included, so the
- * Linux limit would let a prompt reach `spawn()` that can never be launched.
- * 8192 bytes keeps a wide margin under that whole-command-line budget: the
- * query is measured in UTF-8 bytes, and one UTF-16 unit is never more than one
- * UTF-8 byte, so the query plus the flag overhead stays far below 32767 units.
+ * Largest command line `CreateProcess` accepts on Windows: 32767 UTF-16 units,
+ * program name and every argument included. Windows has no per-entry cap, so a
+ * query there may stay in `-q` for as long as the complete command line fits.
  */
-export const HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS = 8192;
+export const HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS = 32767;
 
-/** Largest query the adapter passes as a single argv entry on `platform`. */
-export function hermesInlineQueryLimit(platform: NodeJS.Platform): number {
-  return platform === "win32"
-    ? HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS
-    : HERMES_MAX_INLINE_QUERY_BYTES_LINUX;
+/**
+ * Units held back from the Windows command-line budget for the program name,
+ * the surrounding quotes, and the backslash escaping the loader adds. The
+ * command path is operator-configured and can be long, so the margin is wide.
+ */
+export const HERMES_WINDOWS_COMMAND_LINE_RESERVE_UNITS = 4096;
+
+/** UTF-16 units the Windows command line spends on `args`, quotes included. */
+export function windowsCommandLineUnits(args: readonly string[]): number {
+  return args.reduce((total, arg) => total + arg.length + 2, 0);
 }
 
-/** Largest query the adapter passes as a single argv entry on this host. */
-export const HERMES_MAX_INLINE_QUERY_BYTES = hermesInlineQueryLimit(process.platform);
+/**
+ * True when the query can no longer travel in the inline slot of `args`.
+ *
+ * The comparison is on UTF-8 bytes, which is what the Linux kernel counts: a
+ * query of 40000 astral-plane characters is 160000 bytes and must take the
+ * file path even though its JavaScript `length` is far below the limit.
+ *
+ * Windows has no per-entry cap, so the budget there is the complete command
+ * line in UTF-16 units and `args` is required: a query that still leaves the
+ * whole command line inside the limit keeps the unchanged `-q` command line,
+ * and only a command line that cannot be launched asks for the file transport.
+ */
+export function queryExceedsInlineLimit(
+  query: string,
+  args: readonly string[] = [],
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== "win32") {
+    return Buffer.byteLength(query, "utf8") >= HERMES_MAX_INLINE_QUERY_BYTES;
+  }
+  if (args.length === 0) {
+    throw new Error(
+      "[hermes] The Windows inline check needs the complete command line, not the query alone.",
+    );
+  }
+  return (
+    windowsCommandLineUnits(args) + HERMES_WINDOWS_COMMAND_LINE_RESERVE_UNITS >=
+    HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS
+  );
+}
 
 /** Query flags the CLI accepts, in the mutually exclusive query slot. */
 export const HERMES_INLINE_QUERY_FLAGS = ["-q", "--query"] as const;
 export const HERMES_QUERY_FILE_FLAG = "--query-file";
-
-/**
- * True when the query can no longer travel as one argv entry.
- *
- * The comparison is on UTF-8 bytes, which is what the kernel counts: a query of
- * 40000 astral-plane characters is 160000 bytes and must take the file path
- * even though its JavaScript `length` is far below the limit.
- */
-export function queryExceedsInlineLimit(query: string): boolean {
-  return Buffer.byteLength(query, "utf8") >= HERMES_MAX_INLINE_QUERY_BYTES;
-}
 
 function isInlineQueryFlag(token: string | undefined): boolean {
   return token === "-q" || token === "--query";
