@@ -59,6 +59,7 @@ import {
 } from "./detect-model.js";
 import { hermesSupportsQueryFile } from "./cli-capabilities.js";
 import {
+  HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS,
   HERMES_MAX_INLINE_QUERY_BYTES,
   HERMES_QUERY_FILE_FLAG,
   applyQueryFileTransport,
@@ -534,16 +535,20 @@ export async function execute(
   // `-q <prompt>` is a single argv entry, and Linux caps one entry at
   // MAX_ARG_STRLEN (131072 bytes), independently of the much larger total
   // ARG_MAX budget. Windows caps the whole command line instead, at 32767
-  // UTF-16 units, so the inline limit is platform-specific (query-transport.ts).
-  // A long wake history plus the agent instructions crosses
-  // that size and spawn() fails with E2BIG before Hermes starts, which leaves
-  // the agent looping in `error` with no run. Above the limit the query moves to
-  // a private file that `--query-file` reads, but only after probing that the
-  // configured CLI advertises the flag: a hard switch would break operators
-  // running an older binary or a wrapper.
+  // UTF-16 units, so the inline rule is platform-specific and measured on the
+  // complete argv (query-transport.ts). A long wake history plus the agent
+  // instructions crosses the limit and spawn() fails with E2BIG before Hermes
+  // starts, which leaves the agent looping in `error` with no run. Over the
+  // limit the query moves to a private file that `--query-file` reads, but only
+  // after probing that the configured CLI advertises the flag: a hard switch
+  // would break operators running an older binary or a wrapper.
   let promptTempDir: string | null = null;
-  if (queryExceedsInlineLimit(prompt)) {
+  if (queryExceedsInlineLimit(prompt, args)) {
     const promptBytes = Buffer.byteLength(prompt, "utf8");
+    const limitText =
+      process.platform === "win32"
+        ? `the ${HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS}-unit Windows command-line limit`
+        : `the ${HERMES_MAX_INLINE_QUERY_BYTES}-byte single-argument limit`;
     const support = await hermesSupportsQueryFile({
       command: hermesCmd,
       cwd,
@@ -556,7 +561,7 @@ export async function execute(
           ? `the configured CLI (${hermesCmd}) does not advertise --query-file in "hermes chat --help"`
           : `the --query-file capability probe on ${hermesCmd} was inconclusive (cancelled, timed out, or the binary could not be started)`;
       const message =
-        `[hermes] Prompt is ${promptBytes} bytes, over the ${HERMES_MAX_INLINE_QUERY_BYTES}-byte single-argument limit, and ${cause}. ` +
+        `[hermes] Prompt is ${promptBytes} bytes, over ${limitText}, and ${cause}. ` +
         "Refusing to start instead of failing later with E2BIG. Update the Hermes CLI to a build that supports " +
         '"hermes chat --query-file", or reduce the wake history / agent instructions.';
       await ctx.onLog("stderr", `${message}\n`);
@@ -575,7 +580,7 @@ export async function execute(
       args = applyQueryFileTransport(args, queryFilePath);
       await ctx.onLog(
         "stdout",
-        `[hermes] Prompt is ${promptBytes} bytes (single-argument limit ${HERMES_MAX_INLINE_QUERY_BYTES}); passing it via ${HERMES_QUERY_FILE_FLAG}\n`,
+        `[hermes] Prompt is ${promptBytes} bytes, over ${limitText}; passing it via ${HERMES_QUERY_FILE_FLAG}\n`,
       );
     } catch (error) {
       promptTempDir = null;

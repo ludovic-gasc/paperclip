@@ -187,7 +187,7 @@ describe("hermes-local oversized prompt transport", () => {
     expect(output).toContain("FAKE-QUERY-MODE: file");
     expect(output).toContain(`FAKE-QUERY-BYTES: ${HERMES_MAX_INLINE_QUERY_BYTES}`);
     expect(output).toContain(
-      `[hermes] Prompt is ${HERMES_MAX_INLINE_QUERY_BYTES} bytes (single-argument limit ${HERMES_MAX_INLINE_QUERY_BYTES}); passing it via --query-file`,
+      `[hermes] Prompt is ${HERMES_MAX_INLINE_QUERY_BYTES} bytes, over the ${HERMES_MAX_INLINE_QUERY_BYTES}-byte single-argument limit; passing it via --query-file`,
     );
     // The child read the whole query from the file, not a truncated argv copy.
     expect(output).not.toContain("FAKE-QUERY-READ-ERROR");
