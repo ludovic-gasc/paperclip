@@ -41,9 +41,21 @@ export const HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS = 32767;
  */
 export const HERMES_WINDOWS_COMMAND_LINE_RESERVE_UNITS = 4096;
 
-/** UTF-16 units the Windows command line spends on `args`, quotes included. */
+/**
+ * UTF-16 units the Windows command line spends on `args`, quoting and escaping
+ * included.
+ *
+ * Every argument is wrapped in quotes. A quote or a backslash inside an
+ * argument is then escaped with a backslash of its own, so such a character
+ * costs two units rather than one. The estimate counts every one of them,
+ * which is deliberately conservative: it can only move a query to the file
+ * transport slightly earlier, never later than the launch limit.
+ */
 export function windowsCommandLineUnits(args: readonly string[]): number {
-  return args.reduce((total, arg) => total + arg.length + 2, 0);
+  return args.reduce((total, arg) => {
+    const escaped = (arg.match(/["\\]/g) ?? []).length;
+    return total + arg.length + escaped + 2;
+  }, 0);
 }
 
 /**

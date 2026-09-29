@@ -67,6 +67,16 @@ describe("queryExceedsInlineLimit", () => {
     expect(windowsCommandLineUnits(padded)).toBeGreaterThan(windowsCommandLineUnits(bare));
   });
 
+  test("Windows counts the quotes and backslashes the loader escapes", () => {
+    const plain = "y".repeat(1000);
+    const quoted = '"'.repeat(1000);
+    expect(windowsCommandLineUnits(["chat", "-q", quoted])).toBeGreaterThan(
+      windowsCommandLineUnits(["chat", "-q", plain]),
+    );
+    // A quote inside an argument costs two units: the quote and its escape.
+    expect(windowsCommandLineUnits(['a"b'])).toBe('a"b'.length + 1 + 2);
+  });
+
   test("Windows refuses to guess without the command line", () => {
     expect(() => queryExceedsInlineLimit("y".repeat(10), [], "win32")).toThrow(
       /complete command line/,
