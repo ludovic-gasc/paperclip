@@ -1163,8 +1163,10 @@ Legacy CLI paths that put prompts in command-line arguments (Gemini, Grok, Kimi,
 and Pi) still have argument-size limits. ACP turns, SDK requests, and
 CLI paths that use stdin avoid that separate limit for the wake prompt.
 
-`hermes_local` no longer shares that limit. A query at or above
-`MAX_ARG_STRLEN` (131072 bytes on Linux, `32 * PAGE_SIZE`) is written to a
+`hermes_local` no longer shares that limit. A query at or above the adapter's
+inline limit — `MAX_ARG_STRLEN` (131072 bytes on Linux, `32 * PAGE_SIZE`), and
+8192 bytes on Windows, where `CreateProcess` caps the whole command line at
+32767 UTF-16 units rather than one entry — is written to a
 private file and passed to the CLI as `--query-file <path>`, after probing that
 the configured binary advertises the flag in `hermes chat --help`. When the
 binary does not support it, the adapter refuses to start with a message naming

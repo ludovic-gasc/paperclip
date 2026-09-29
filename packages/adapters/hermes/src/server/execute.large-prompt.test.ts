@@ -13,7 +13,7 @@
  * argv the child actually receives, and the cleanup of the query file.
  */
 
-import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -195,6 +195,36 @@ describe("hermes-local oversized prompt transport", () => {
     const queryFile = /FAKE-QUERY-FILE: (.+)/.exec(output)?.[1]?.trim();
     expect(queryFile).toBeTruthy();
     await expect(access(queryFile as string)).rejects.toThrow();
+  });
+
+  test("removes the query file when the pre-spawn log fails", async () => {
+    const markdown = markdownForPromptBytes(HERMES_MAX_INLINE_QUERY_BYTES);
+    const { ctx, logs } = makeCtx({ markdown });
+    const prefix = "paperclip-hermes-prompt-";
+    const before = (await readdir(os.tmpdir())).filter((entry) => entry.startsWith(prefix));
+
+    const failingCtx = {
+      ...ctx,
+      onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+        if (String(chunk).includes("single-argument limit")) {
+          throw new Error("log sink down");
+        }
+        logs.push({ stream, chunk: String(chunk) });
+      },
+    } as unknown as AdapterExecutionContext;
+
+    let failure: unknown = null;
+    try {
+      await execute(failingCtx);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect((failure as Error)?.message).toBe("log sink down");
+    const after = (await readdir(os.tmpdir())).filter(
+      (entry) => entry.startsWith(prefix) && !before.includes(entry),
+    );
+    expect(after).toEqual([]);
   });
 
   test("refuses to start when the CLI does not advertise --query-file", async () => {

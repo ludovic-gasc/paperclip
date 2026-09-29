@@ -14,14 +14,36 @@
  */
 
 /**
- * Largest query the adapter passes as a single argv entry.
+ * Largest query the adapter passes as a single argv entry on Linux.
  *
  * `MAX_ARG_STRLEN` is `32 * PAGE_SIZE`, so 131072 bytes on a 4 KiB-page kernel.
  * Measured on Linux 7.2.x / PAGE_SIZE 4096: 131071 bytes start, 131072 bytes
  * fail with `E2BIG`. This is a compile-time kernel constant, not a sysctl:
  * `RLIMIT_STACK` moves the total argv+env budget, never the per-string cap.
  */
-export const HERMES_MAX_INLINE_QUERY_BYTES = 131072;
+export const HERMES_MAX_INLINE_QUERY_BYTES_LINUX = 131072;
+
+/**
+ * Largest query the adapter passes as a single argv entry on Windows.
+ *
+ * Windows has no per-entry cap. `CreateProcess` limits the whole command line
+ * to 32767 UTF-16 units, program name and every other flag included, so the
+ * Linux limit would let a prompt reach `spawn()` that can never be launched.
+ * 8192 bytes keeps a wide margin under that whole-command-line budget: the
+ * query is measured in UTF-8 bytes, and one UTF-16 unit is never more than one
+ * UTF-8 byte, so the query plus the flag overhead stays far below 32767 units.
+ */
+export const HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS = 8192;
+
+/** Largest query the adapter passes as a single argv entry on `platform`. */
+export function hermesInlineQueryLimit(platform: NodeJS.Platform): number {
+  return platform === "win32"
+    ? HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS
+    : HERMES_MAX_INLINE_QUERY_BYTES_LINUX;
+}
+
+/** Largest query the adapter passes as a single argv entry on this host. */
+export const HERMES_MAX_INLINE_QUERY_BYTES = hermesInlineQueryLimit(process.platform);
 
 /** Query flags the CLI accepts, in the mutually exclusive query slot. */
 export const HERMES_INLINE_QUERY_FLAGS = ["-q", "--query"] as const;
