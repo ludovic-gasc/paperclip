@@ -533,9 +533,11 @@ export async function execute(
   // ── Keep an oversized query out of argv ────────────────────────────────
   // `-q <prompt>` is a single argv entry, and Linux caps one entry at
   // MAX_ARG_STRLEN (131072 bytes), independently of the much larger total
-  // ARG_MAX budget. A long wake history plus the agent instructions crosses
+  // ARG_MAX budget. Windows caps the whole command line instead, at 32767
+  // UTF-16 units, so the inline limit is platform-specific (query-transport.ts).
+  // A long wake history plus the agent instructions crosses
   // that size and spawn() fails with E2BIG before Hermes starts, which leaves
-  // the agent looping in `error` with no run. Above the cap the query moves to
+  // the agent looping in `error` with no run. Above the limit the query moves to
   // a private file that `--query-file` reads, but only after probing that the
   // configured CLI advertises the flag: a hard switch would break operators
   // running an older binary or a wrapper.
@@ -562,15 +564,26 @@ export async function execute(
     }
 
     // 0700 directory holding a 0600 file: the prompt carries task content and
-    // must not be world-readable in a shared temp directory.
-    promptTempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-prompt-"));
-    const queryFilePath = path.join(promptTempDir, "query.txt");
-    await fs.writeFile(queryFilePath, prompt, { encoding: "utf8", mode: 0o600 });
-    args = applyQueryFileTransport(args, queryFilePath);
-    await ctx.onLog(
-      "stdout",
-      `[hermes] Prompt is ${promptBytes} bytes (single-argument limit ${HERMES_MAX_INLINE_QUERY_BYTES}); passing it via ${HERMES_QUERY_FILE_FLAG}\n`,
-    );
+    // must not be world-readable in a shared temp directory. The write and the
+    // pre-spawn log live inside the try so that a failure there removes the
+    // directory instead of leaving the prompt on disk.
+    const promptTempDirPath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-prompt-"));
+    promptTempDir = promptTempDirPath;
+    try {
+      const queryFilePath = path.join(promptTempDirPath, "query.txt");
+      await fs.writeFile(queryFilePath, prompt, { encoding: "utf8", mode: 0o600 });
+      args = applyQueryFileTransport(args, queryFilePath);
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Prompt is ${promptBytes} bytes (single-argument limit ${HERMES_MAX_INLINE_QUERY_BYTES}); passing it via ${HERMES_QUERY_FILE_FLAG}\n`,
+      );
+    } catch (error) {
+      promptTempDir = null;
+      await fs.rm(promptTempDirPath, { recursive: true, force: true }).catch(() => {
+        // Best-effort cleanup: report the original failure, not this one.
+      });
+      throw error;
+    }
   }
 
   // Assert the query slot before spawning: a `--query-file` placed anywhere

@@ -15,10 +15,31 @@ import { describe, expect, test } from "vitest";
 
 import {
   HERMES_MAX_INLINE_QUERY_BYTES,
+  HERMES_MAX_INLINE_QUERY_BYTES_LINUX,
+  HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS,
   applyQueryFileTransport,
   assertHermesChatQueryTransport,
+  hermesInlineQueryLimit,
   queryExceedsInlineLimit,
 } from "./query-transport.js";
+
+describe("hermesInlineQueryLimit", () => {
+  test("Linux keeps the per-entry MAX_ARG_STRLEN cap", () => {
+    expect(hermesInlineQueryLimit("linux")).toBe(131072);
+    expect(HERMES_MAX_INLINE_QUERY_BYTES_LINUX).toBe(131072);
+  });
+
+  test("Windows uses the whole-command-line budget, not the Linux per-entry cap", () => {
+    // CreateProcess caps the whole command line at 32767 UTF-16 units, so a
+    // 131072-byte entry can never be launched from there.
+    expect(hermesInlineQueryLimit("win32")).toBe(HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS);
+    expect(HERMES_MAX_INLINE_QUERY_BYTES_WINDOWS).toBeLessThan(32767);
+  });
+
+  test("the exported limit is the limit of the host platform", () => {
+    expect(HERMES_MAX_INLINE_QUERY_BYTES).toBe(hermesInlineQueryLimit(process.platform));
+  });
+});
 
 describe("queryExceedsInlineLimit", () => {
   test("a query one byte under MAX_ARG_STRLEN stays in argv", () => {
