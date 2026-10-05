@@ -111,7 +111,7 @@ export const AI_CONNECTION_CAPABILITIES: Record<
 /**
  * Returns true if the given adapter type uses the AI connection system at all
  * (i.e. it appears in at least one provider/method entry). Adapters that manage
- * their own auth (bob_shell, hermes_local, kimi_local, etc.) return false.
+ * their own auth (hermes_local, kimi_local, etc.) return false.
  */
 export function adapterUsesAiConnection(adapterType: string): boolean {
   // paperclip_runner delegates to a sub-adapter (claude_local, codex_local,
