@@ -178,4 +178,3 @@ export function resolveInstanceHealthToken(options: {
     return null;
   }
 }
-

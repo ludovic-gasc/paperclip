@@ -12,4 +12,3 @@ export function NewAgent() {
   }, [setBreadcrumbs]);
   return <NewAgentSetup />;
 }
-

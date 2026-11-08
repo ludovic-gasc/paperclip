@@ -6,6 +6,9 @@
  *
  * Verified CLI flags (hermes chat):
  *   -q/--query         single query (non-interactive)
+ *   --query-file       read the query from a file ('-' reads stdin); the
+ *                      fallback used when the query cannot fit in one argv
+ *                      entry (see query-transport.ts)
  *   -Q/--quiet         quiet mode (no banner/spinner, only response + session_id)
  *   -m/--model         model name (e.g. anthropic/claude-sonnet-4)
  *   -t/--toolsets      comma-separated toolsets to enable
@@ -19,6 +22,7 @@
  */
 
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import type {
@@ -34,10 +38,8 @@ import {
   renderTemplate,
   ensureAbsoluteDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
-  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
-  renderPaperclipWakePrompt,
-  selectPaperclipTaskMarkdown,
+  selectPaperclipPromptSections,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -54,6 +56,15 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
+import { hermesSupportsQueryFile } from "./cli-capabilities.js";
+import {
+  HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS,
+  HERMES_MAX_INLINE_QUERY_BYTES,
+  HERMES_QUERY_FILE_FLAG,
+  applyQueryFileTransport,
+  assertHermesChatQueryTransport,
+  queryExceedsInlineLimit,
+} from "./query-transport.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 // ---------------------------------------------------------------------------
@@ -74,6 +85,14 @@ function cfgStringArray(v: unknown): string[] | undefined {
     ? (v as string[])
     : undefined;
 }
+function cfgEnvString(v: unknown): string | undefined {
+  if (typeof v === "string" && v.length > 0) return v;
+  if (v && typeof v === "object" && "value" in v) {
+    const value = (v as { value?: unknown }).value;
+    return typeof value === "string" && value.length > 0 ? value : undefined;
+  }
+  return undefined;
+}
 
 export function resolveHermesCommand(config: Record<string, unknown>): string {
   return cfgString(config.hermesCommand) || cfgString(config.command) || HERMES_CLI;
@@ -83,7 +102,7 @@ export function resolveHermesCommand(config: Record<string, unknown>): string {
 // Wake-up prompt builder
 // ---------------------------------------------------------------------------
 
-const HERMES_DEFAULT_PROMPT_TEMPLATE = [
+const HERMES_RUNTIME_IDENTITY_TEMPLATE = [
   'You are "{{agent.name}}", an AI agent employee in a Paperclip-managed company.',
   "",
   "Paperclip runtime identity:",
@@ -91,7 +110,11 @@ const HERMES_DEFAULT_PROMPT_TEMPLATE = [
   "- Company ID: {{agent.companyId}}",
   "- Run ID: {{run.id}}",
   "- API base: {{paperclipApiUrl}}",
-  "",
+].join("\n");
+
+// Hermes applies this overlay at each API call, including after compaction,
+// without storing it in conversation history. Keep run/task deltas in -q.
+const HERMES_SYSTEM_PROMPT_TEMPLATE = [
   "Paperclip API guidance:",
   "- Use `curl` from the terminal for Paperclip API calls; browser/web extraction tools may not reach localhost.",
   "- Use `$PAPERCLIP_API_URL`, `$PAPERCLIP_API_KEY`, and `$PAPERCLIP_RUN_ID`; do not hard-code local ports or copy secrets into comments.",
@@ -113,7 +136,7 @@ const HERMES_DEFAULT_PROMPT_TEMPLATE = [
   "MD",
   ")",
   "jq -n --arg status done --arg comment \"$body\" '{status:$status, comment:$comment}' | \\",
-  "  curl -sS -X PATCH \"$api/issues/{{context.issueId}}\" \\",
+  "  curl -sS -X PATCH \"$api/issues/$PAPERCLIP_TASK_ID\" \\",
   "    -H \"Authorization: Bearer $PAPERCLIP_API_KEY\" \\",
   "    -H \"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\" \\",
   "    -H \"Content-Type: application/json\" \\",
@@ -142,9 +165,7 @@ export function buildPrompt(
   options: { resumedSession?: boolean } = {},
 ): string {
   const context = (ctx as any).context || {};
-  const template = cfgString(config.promptTemplate) || (context.conversationMode === true
-    ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
-    : HERMES_DEFAULT_PROMPT_TEMPLATE);
+  const template = cfgString(config.promptTemplate);
   const taskId = cfgString(context.taskId) || cfgString(context.issueId) || cfgString(ctx.config?.taskId);
   const taskTitle = cfgString(context.taskTitle) || cfgString(ctx.config?.taskTitle) || "";
   const taskBody = cfgString(context.taskBody) || cfgString(ctx.config?.taskBody) || "";
@@ -164,16 +185,13 @@ export function buildPrompt(
     paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "") + "/api";
   }
 
-  const paperclipTaskMarkdown = selectPaperclipTaskMarkdown(context, {
+  const { taskContextNote: taskContextMarkdown, wakePrompt } = selectPaperclipPromptSections(context, {
     resumedSession: options.resumedSession === true,
+    includeCommunicationGuidance: true,
   });
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-    conversationMode: context.conversationMode === true,
-    resumedSession: options.resumedSession === true,
-    // The task-context markdown is the authoritative brief on this lane; keep
-    // the wake prompt's description copy out so the prompt carries it once.
-    suppressIssueDescription: paperclipTaskMarkdown.length > 0,
-  });
+  // Keep the historical variable available to custom templates. Automatic
+  // assembly uses the ownership-aware assignment variant below.
+  const paperclipTaskMarkdown = cfgString(context.paperclipTaskMarkdown)?.trim() || "";
   const sessionHandoffMarkdown = cfgString(context.paperclipSessionHandoffMarkdown)?.trim() || "";
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake) || "";
 
@@ -197,19 +215,21 @@ export function buildPrompt(
     paperclipWakePrompt: wakePrompt,
     paperclipTaskMarkdown,
     taskContext: paperclipTaskMarkdown,
+    taskContextMarkdown,
     paperclipWakeJson: wakePayloadJson,
     wakePayloadJson,
     paperclipApiKeyEnv: "PAPERCLIP_API_KEY",
     paperclipRunIdEnv: "PAPERCLIP_RUN_ID",
   };
 
-  const rendered = isPaperclipRecoveryWakePayload(context.paperclipWake)
-    ? ""
-    : renderTemplate(renderConditionalSections(template, vars), vars);
+  const rendered = template && !isPaperclipRecoveryWakePayload(context.paperclipWake)
+    ? renderTemplate(renderConditionalSections(template, vars), vars)
+    : "";
   return joinPromptSections([
+    renderTemplate(HERMES_RUNTIME_IDENTITY_TEMPLATE, vars),
     wakePrompt,
     sessionHandoffMarkdown,
-    paperclipTaskMarkdown,
+    taskContextMarkdown,
     rendered,
   ]);
 }
@@ -407,7 +427,7 @@ export async function execute(
 
   // ── Load agent instructions file (Paperclip instruction bundles) ──────
   // Paperclip can materialize managed instructions into instructionsFilePath;
-  // when present, inject that bundle into the Hermes prompt.
+  // when present, reapply that bundle through Hermes's native system overlay.
   const instructionsFilePath = cfgString(config.instructionsFilePath);
   let agentInstructions = "";
   if (instructionsFilePath) {
@@ -433,15 +453,22 @@ export async function execute(
   }
 
   // ── Build prompt ───────────────────────────────────────────────────────
-  let prompt = buildPrompt(ctx, config, { resumedSession: Boolean(prevSessionId) });
-  if (agentInstructions) {
-    prompt = agentInstructions + "\n\n---\n\n" + prompt;
+  const userEnvForPrompt = config.env as Record<string, unknown> | undefined;
+  const promptConfig: Record<string, unknown> = { ...config };
+  if (!cfgString(promptConfig.paperclipApiUrl) && userEnvForPrompt && typeof userEnvForPrompt === "object") {
+    const configuredPaperclipApiUrl = cfgEnvString(userEnvForPrompt.PAPERCLIP_API_URL);
+    if (configuredPaperclipApiUrl) {
+      promptConfig.paperclipApiUrl = configuredPaperclipApiUrl;
+    }
   }
+
+  const sessionId = persistSession ? prevSessionId : undefined;
+  const prompt = buildPrompt(ctx, promptConfig, { resumedSession: Boolean(sessionId) });
 
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
-  const args: string[] = ["chat", "-q", prompt];
+  let args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
 
   if (model) {
@@ -477,22 +504,29 @@ export async function execute(
   // system is designed for human-attended interactive sessions.
   args.push("--yolo");
 
-  if (persistSession && prevSessionId) {
-    args.push("--resume", prevSessionId);
-  }
-
-  if (extraArgs?.length) {
-    args.push(...extraArgs);
-  }
+  // Failed resumes remain failures. Do not infer a safe restart from CLI text.
+  if (sessionId) args.push("--resume", sessionId);
+  if (extraArgs?.length) args.push(...extraArgs);
 
   // ── Build environment ──────────────────────────────────────────────────
   const userEnv = config.env as Record<string, string> | undefined;
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
-    ...buildPaperclipEnv(ctx.agent),
+    ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
+
+  // Scope the overlay to this child process. Read the current bundle on every
+  // invocation; never infer its availability from a persisted session ID.
+  // Preserve an operator's explicit overlay before Paperclip's instructions.
+  env.HERMES_EPHEMERAL_SYSTEM_PROMPT = joinPromptSections([
+    env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+    agentInstructions,
+    renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, {
+      agent: ctx.agent,
+    }),
+  ]);
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
@@ -513,23 +547,92 @@ export async function execute(
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
 
   // ── Resolve working directory ──────────────────────────────────────────
+  const workspace = ctx.context?.paperclipWorkspace;
+  const workspaceCwd = workspace && typeof workspace === "object"
+    ? cfgString((workspace as Record<string, unknown>).cwd)
+    : undefined;
   const cwd =
-    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+    cfgString(config.cwd) || workspaceCwd || cfgString(ctx.config?.workspaceDir) || ".";
   try {
     await ensureAbsoluteDirectory(cwd);
   } catch {
     // Non-fatal
   }
 
+  // ── Keep an oversized query out of argv ────────────────────────────────
+  // `-q <prompt>` is a single argv entry, and Linux caps one entry at
+  // MAX_ARG_STRLEN (131072 bytes), independently of the much larger total
+  // ARG_MAX budget. Windows caps the whole command line instead, at 32767
+  // UTF-16 units, so the inline rule is platform-specific and measured on the
+  // complete argv (query-transport.ts). A long wake history plus the agent
+  // instructions crosses the limit and spawn() fails with E2BIG before Hermes
+  // starts, which leaves the agent looping in `error` with no run. Over the
+  // limit the query moves to a private file that `--query-file` reads, but only
+  // after probing that the configured CLI advertises the flag: a hard switch
+  // would break operators running an older binary or a wrapper.
+  let promptTempDir: string | null = null;
+  if (queryExceedsInlineLimit(prompt, args)) {
+    const promptBytes = Buffer.byteLength(prompt, "utf8");
+    const limitText =
+      process.platform === "win32"
+        ? `the ${HERMES_MAX_COMMAND_LINE_UNITS_WINDOWS}-unit Windows command-line limit`
+        : `the ${HERMES_MAX_INLINE_QUERY_BYTES}-byte single-argument limit`;
+    const support = await hermesSupportsQueryFile({
+      command: hermesCmd,
+      cwd,
+      env,
+      signal: ctx.signal,
+    });
+    if (support !== true) {
+      const cause =
+        support === false
+          ? `the configured CLI (${hermesCmd}) does not advertise --query-file in "hermes chat --help"`
+          : `the --query-file capability probe on ${hermesCmd} was inconclusive (cancelled, timed out, or the binary could not be started)`;
+      const message =
+        `[hermes] Prompt is ${promptBytes} bytes, over ${limitText}, and ${cause}. ` +
+        "Refusing to start instead of failing later with E2BIG. Update the Hermes CLI to a build that supports " +
+        '"hermes chat --query-file", or reduce the wake history / agent instructions.';
+      await ctx.onLog("stderr", `${message}\n`);
+      throw new Error(message);
+    }
+
+    // 0700 directory holding a 0600 file: the prompt carries task content and
+    // must not be world-readable in a shared temp directory. The write and the
+    // pre-spawn log live inside the try so that a failure there removes the
+    // directory instead of leaving the prompt on disk.
+    const promptTempDirPath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-prompt-"));
+    promptTempDir = promptTempDirPath;
+    try {
+      const queryFilePath = path.join(promptTempDirPath, "query.txt");
+      await fs.writeFile(queryFilePath, prompt, { encoding: "utf8", mode: 0o600 });
+      args = applyQueryFileTransport(args, queryFilePath);
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Prompt is ${promptBytes} bytes, over ${limitText}; passing it via ${HERMES_QUERY_FILE_FLAG}\n`,
+      );
+    } catch (error) {
+      promptTempDir = null;
+      await fs.rm(promptTempDirPath, { recursive: true, force: true }).catch(() => {
+        // Best-effort cleanup: report the original failure, not this one.
+      });
+      throw error;
+    }
+  }
+
+  // Assert the query slot before spawning: a `--query-file` placed anywhere
+  // else in argv is read as positional text by `hermes chat` and the run never
+  // starts.
+  assertHermesChatQueryTransport(args);
+
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
     `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
-  if (prevSessionId) {
+  if (sessionId) {
     await ctx.onLog(
       "stdout",
-      `[hermes] Resuming session: ${prevSessionId}\n`,
+      `[hermes] Resuming session: ${sessionId}\n`,
     );
   }
 
@@ -557,14 +660,23 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
-    onSpawn: ctx.onSpawn,
-  });
+  let result: Awaited<ReturnType<typeof runChildProcess>>;
+  try {
+    result = await runChildProcess(ctx.runId, hermesCmd, args, {
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+      onSpawn: ctx.onSpawn,
+    });
+  } finally {
+    if (promptTempDir) {
+      await fs.rm(promptTempDir, { recursive: true, force: true }).catch(() => {
+        // Best-effort cleanup: the run result matters more than the temp dir.
+      });
+    }
+  }
 
   // ── Parse output ───────────────────────────────────────────────────────
   const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");

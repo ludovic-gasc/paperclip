@@ -284,4 +284,3 @@ describe("AgyLocalConfigFields", () => {
     expect(hiddenHtml).not.toContain("Per-agent skills root");
   });
 });
-
