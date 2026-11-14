@@ -36,7 +36,6 @@ const nonServerProjects = [
   "@paperclipai/adapter-kimi-local",
   "@paperclipai/adapter-openclaw-gateway",
   "@paperclipai/adapter-opencode-local",
-  "@paperclipai/adapter-agy-local",
   "@paperclipai/adapter-pi-local",
   "@paperclipai/plugin-daytona",
   "@paperclipai/plugin-sdk",

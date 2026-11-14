@@ -1,6 +1,6 @@
 {
   "name": "paperclipai",
-  "version": "2026.1106.0+local.1",
+  "version": "2026.1106.0+local.2",
   "description": "Paperclip CLI — orchestrate AI agent teams to run a business",
   "type": "module",
   "bin": {
@@ -37,7 +37,6 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.7.0",
-    "@paperclipai/adapter-agy-local": "workspace:*",
     "@paperclipai/adapter-claude-local": "workspace:*",
     "@paperclipai/adapter-codex-local": "workspace:*",
     "@paperclipai/adapter-cursor-cloud": "workspace:*",
